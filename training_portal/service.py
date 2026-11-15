@@ -4,6 +4,8 @@ import csv
 import hashlib
 import io
 import os
+import re
+import socket
 import sqlite3
 import threading
 import time
@@ -29,6 +31,22 @@ PAUSE_POLL_SECONDS = 0.2
 PAUSE_MAX_SECONDS = 300.0
 CLEANUP_IDLE_SECONDS = 0.5
 CLEANUP_RETRY_SECONDS = 1.5
+
+# Instance liveness for rolling-update handover. Every instance heartbeats
+# into the shared SQLite volume; an instance whose heartbeat is older than
+# INSTANCE_STALE_SECONDS is considered gone, and only then may its in-flight
+# jobs be reaped by a survivor.
+HEARTBEAT_INTERVAL_SECONDS = 1.0
+INSTANCE_STALE_SECONDS = 5.0
+REAPER_INTERVAL_SECONDS = 1.0
+# An unreferenced export file younger than this may be a peer's publication
+# in flight (rename happens just before the row commits), so it is spared.
+ORPHAN_GRACE_SECONDS = 30.0
+# Instance rows of long-dead instances are forgotten after this horizon.
+INSTANCE_ROW_TTL_SECONDS = 3600.0
+
+TMP_NAME_RE = re.compile(r"job-(\d+)-.+\.csv")
+INTERRUPTED_MESSAGE = "服务重启中断了本次生成，未发布任何文件，请重新提交该批次"
 
 
 class ValidationError(Exception):
@@ -120,9 +138,23 @@ class Portal:
     Consent state lives only in SQLite. Every path that can expose corpus data
     (ingest, generation, publication, download) reads it inside a transaction,
     so a revocation is a single linearization point for all of them.
+
+    Several instances may share one data volume during a rolling update. Each
+    instance registers in the ``instances`` table and heartbeats; a job in
+    ``running``/``paused`` belongs to the instance that claimed it
+    (``owner_id``) and is only treated as interrupted once that owner is
+    gone - never while the old instance is still alive.
     """
 
-    def __init__(self, data_dir: Path):
+    def __init__(
+        self,
+        data_dir: Path,
+        *,
+        heartbeat_interval: float = HEARTBEAT_INTERVAL_SECONDS,
+        stale_after: float = INSTANCE_STALE_SECONDS,
+        reaper_interval: float = REAPER_INTERVAL_SECONDS,
+        orphan_grace: float = ORPHAN_GRACE_SECONDS,
+    ):
         self.data_dir = Path(data_dir)
         self.export_dir = self.data_dir / "exports"
         self.tmp_dir = self.data_dir / "tmp"
@@ -130,13 +162,25 @@ class Portal:
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
         self.db = Database(self.data_dir / "portal.sqlite3")
         self.db.init()
+        self.heartbeat_interval = heartbeat_interval
+        self.stale_after = stale_after
+        self.reaper_interval = reaper_interval
+        self.orphan_grace = orphan_grace
+        self.instance_id = (
+            f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+        )
+        self.started_at = utc_now()
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._delete_lock = threading.Lock()
         self._publish_lock = threading.Lock()
+        self._publishing: set[str] = set()
         self._threads: list[threading.Thread] = []
-        self._recover_interrupted_jobs()
-        self._sweep_orphans()
+        self._beat()
+        self._reap_dead_instances()
+        self._sweep_tmp_files()
+        self._sweep_orphan_exports(startup=True)
+        self._demote_missing_ready_files()
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -147,6 +191,8 @@ class Portal:
         for name, target in (
             ("generator", self._generator_loop),
             ("cleanup", self._cleanup_loop),
+            ("heartbeat", self._heartbeat_loop),
+            ("reaper", self._reaper_loop),
         ):
             thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
@@ -160,60 +206,169 @@ class Portal:
         for thread in self._threads:
             thread.join(timeout=5)
         self._threads.clear()
+        # A clean exit deregisters the heartbeat, so a surviving peer can reap
+        # anything left behind immediately instead of waiting for staleness.
+        try:
+            self._deregister()
+        except Exception:  # pragma: no cover - shutdown must not raise
+            pass
 
-    def _recover_interrupted_jobs(self) -> None:
-        """Fail jobs a previous process left mid-flight.
-
-        A job that was ``running`` or held at the ``paused`` demo gate has lost
-        its temp file. Publishing it later from a partial read would be wrong,
-        so it is closed as ``failed`` with a message that says the operator has
-        to request the batch again. ``queued`` jobs survive: they have not
-        started and the worker picks them up normally.
-        """
+    # ------------------------------------------------------------------
+    # instance liveness / rolling-update handover
+    # ------------------------------------------------------------------
+    def _beat(self) -> None:
         with self.db.transaction() as conn:
-            orphaned = conn.execute(
-                "SELECT id FROM jobs WHERE status IN ('running', 'paused')"
-            ).fetchall()
-            if not orphaned:
-                return
             conn.execute(
-                "UPDATE jobs SET status = 'failed', finished_at = ?, message = ?, "
-                "written_rows = 0 WHERE status IN ('running', 'paused')",
-                (
-                    utc_now(),
-                    "服务重启中断了本次生成，未发布任何文件，请重新提交该批次",
-                ),
+                "INSERT INTO instances(instance_id, started_at, heartbeat_ts) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(instance_id) DO UPDATE SET "
+                "heartbeat_ts = excluded.heartbeat_ts",
+                (self.instance_id, self.started_at, time.time()),
             )
 
-    def _sweep_orphans(self) -> None:
-        """Remove temp files and any export file not backed by a live row.
+    def _deregister(self) -> None:
+        with self.db.transaction() as conn:
+            conn.execute(
+                "DELETE FROM instances WHERE instance_id = ?", (self.instance_id,)
+            )
 
-        Unreferenced files are unlinked at boot, so a crash part-way through
-        publication or deletion cannot leave readable residue. A ``ready`` row
-        whose file vanished is demoted to ``pending_delete`` so it can never be
-        served as a phantom later.
+    def _heartbeat_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._beat()
+            except Exception:  # pragma: no cover - keep the worker alive
+                time.sleep(0.2)
+            self._stop.wait(self.heartbeat_interval)
+
+    def _reaper_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._reap_dead_instances()
+                self._sweep_tmp_files()
+                self._sweep_orphan_exports(startup=False)
+            except Exception:  # pragma: no cover - keep the worker alive
+                pass
+            self._stop.wait(self.reaper_interval)
+
+    def _live_instance_ids(self, conn: sqlite3.Connection) -> set[str]:
+        cutoff = time.time() - self.stale_after
+        return {
+            row["instance_id"]
+            for row in conn.execute(
+                "SELECT instance_id FROM instances WHERE heartbeat_ts >= ?",
+                (cutoff,),
+            )
+        }
+
+    def _reap_dead_instances(self) -> list[int]:
+        """Fail in-flight jobs whose owning instance is gone; return their ids.
+
+        A job in ``running``/``paused`` is left alone while its owner's
+        heartbeat is fresh: during a rolling update the old instance may still
+        finish and publish it. Only once the owner has deregistered or its
+        heartbeat went stale is the job interrupted - marked ``failed`` and
+        its temp file removed. Jobs owned by this instance are never reaped
+        here (its own generator manages them), and ``queued`` jobs are never
+        touched: any worker picks them up.
         """
-        for tmp in self.tmp_dir.glob("*"):
-            if tmp.is_file():
+        with self.db.transaction() as conn:
+            live = self._live_instance_ids(conn)
+            doomed = [
+                int(row["id"])
+                for row in conn.execute(
+                    "SELECT id, owner_id FROM jobs "
+                    "WHERE status IN ('running', 'paused')"
+                )
+                if row["owner_id"] != self.instance_id
+                and row["owner_id"] not in live
+            ]
+            if doomed:
+                placeholders = ",".join("?" for _ in doomed)
+                conn.execute(
+                    f"UPDATE jobs SET status = 'failed', finished_at = ?, "
+                    f"message = ?, written_rows = 0 "
+                    f"WHERE id IN ({placeholders}) "
+                    f"AND status IN ('running', 'paused')",
+                    (utc_now(), INTERRUPTED_MESSAGE, *doomed),
+                )
+            # Forget instances that have been gone for a long time.
+            conn.execute(
+                "DELETE FROM instances WHERE heartbeat_ts < ?",
+                (time.time() - INSTANCE_ROW_TTL_SECONDS,),
+            )
+        for job_id in doomed:
+            for tmp in self.tmp_dir.glob(f"job-{job_id}-*.csv"):
                 _unlink_quietly(tmp)
+        return doomed
 
+    def _sweep_tmp_files(self) -> None:
+        """Remove temp files no live in-flight job can still publish.
+
+        The job id is encoded in the temp file name, and a job still in
+        ``running``/``paused`` always has a live owner (dead owners were
+        reaped first), so keeping exactly the temp files of in-flight jobs
+        never pulls a file a surviving old instance is about to publish.
+        """
         with self.db.read() as conn:
-            rows = conn.execute(
-                "SELECT id, stored_name, status FROM exports"
-            ).fetchall()
-        known = {row["stored_name"] for row in rows}
-        for path in self.export_dir.glob("*"):
-            if path.is_file() and path.name not in known:
-                _unlink_quietly(path)
+            active = {
+                int(row["id"])
+                for row in conn.execute(
+                    "SELECT id FROM jobs WHERE status IN ('running', 'paused')"
+                )
+            }
+        for tmp in self.tmp_dir.glob("*"):
+            if not tmp.is_file():
+                continue
+            match = TMP_NAME_RE.match(tmp.name)
+            if match and int(match.group(1)) in active:
+                continue
+            _unlink_quietly(tmp)
 
-        missing = [
-            (int(row["id"]), row["stored_name"])
-            for row in rows
-            if row["status"] == "ready"
-            and not (self.export_dir / row["stored_name"]).exists()
-        ]
-        # Rows already flagged for deletion stay flagged; nothing here can make
-        # a pending or deleted record downloadable again.
+    def _sweep_orphan_exports(self, *, startup: bool) -> None:
+        """Remove export files no export row references.
+
+        Publication renames the file into place just before its row commits,
+        so a very young unreferenced file is usually a publication in flight -
+        this instance's (tracked in ``_publishing``) or a live peer's. At
+        startup with no live peer nothing can be mid-publish, so every
+        unreferenced file goes immediately. Files referenced by a row -
+        including ``ready`` downloads - are never touched.
+        """
+        with self.db.read() as conn:
+            known = {
+                row["stored_name"]
+                for row in conn.execute("SELECT stored_name FROM exports")
+            }
+            live_peers = self._live_instance_ids(conn) - {self.instance_id}
+        with self._publish_lock:
+            publishing = set(self._publishing)
+        now = time.time()
+        for path in self.export_dir.glob("*"):
+            if not path.is_file() or path.name in known or path.name in publishing:
+                continue
+            try:
+                age = now - path.stat().st_mtime
+            except OSError:
+                continue
+            if age < self.orphan_grace and (live_peers or not startup):
+                continue
+            _unlink_quietly(path)
+
+    def _demote_missing_ready_files(self) -> None:
+        """Demote ``ready`` rows whose file vanished to ``pending_delete``.
+
+        A ``ready`` row whose file is gone must never be served as a phantom;
+        demoting keeps it non-downloadable and lets the cleanup worker finish
+        the record off. Rows already flagged for deletion stay flagged.
+        """
+        with self.db.read() as conn:
+            missing = [
+                (int(row["id"]), row["stored_name"])
+                for row in conn.execute(
+                    "SELECT id, stored_name FROM exports WHERE status = 'ready'"
+                )
+                if not (self.export_dir / row["stored_name"]).exists()
+            ]
         if missing:
             with self.db.transaction() as conn:
                 for export_id, stored_name in missing:
@@ -468,9 +623,9 @@ class Portal:
     def _process_job(self, job_id: int) -> None:
         with self.db.transaction() as conn:
             claimed = conn.execute(
-                "UPDATE jobs SET status = 'running', started_at = ?, message = ? "
-                "WHERE id = ? AND status = 'queued'",
-                (utc_now(), "生成中", job_id),
+                "UPDATE jobs SET status = 'running', started_at = ?, message = ?, "
+                "owner_id = ? WHERE id = ? AND status = 'queued'",
+                (utc_now(), "生成中", self.instance_id, job_id),
             ).rowcount
             job = conn.execute(
                 "SELECT batch FROM jobs WHERE id = ?", (job_id,)
@@ -661,6 +816,9 @@ class Portal:
         hashes: set[str] = result["hashes"]
 
         with self._publish_lock:
+            # Registered before the rename so this instance's own orphan sweep
+            # can never mistake the not-yet-committed file for residue.
+            self._publishing.add(stored_name)
             os.replace(tmp_path, final_path)
             size = final_path.stat().st_size
             now = utc_now()
@@ -735,6 +893,7 @@ class Portal:
             finally:
                 if not keep:
                     _unlink_quietly(final_path)
+                self._publishing.discard(stored_name)
 
     # ------------------------------------------------------------------
     # download gate

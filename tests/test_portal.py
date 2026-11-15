@@ -426,3 +426,221 @@ def test_download_blocks_text_withdrawn_before_export(portal):
             break
         time.sleep(0.05)
     assert row["status"] == "deleted"
+
+
+# ---------------------------------------------------------------------------
+# rolling-update handover: two instances sharing one data volume
+# ---------------------------------------------------------------------------
+def handover_portal(data_dir) -> Portal:
+    """An instance with fast liveness timers, as in a rolling update."""
+    instance = Portal(
+        data_dir, heartbeat_interval=0.1, stale_after=2.0, reaper_interval=0.2
+    )
+    instance.start_workers()
+    return instance
+
+
+def get_job(instance: Portal, job_id: int) -> dict:
+    for job in instance.jobs():
+        if job["id"] == job_id:
+            return job
+    raise AssertionError(f"job {job_id} not found")
+
+
+def wait_for_status(
+    instance: Portal, job_id: int, *statuses: str, timeout: float = 5.0
+) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        job = get_job(instance, job_id)
+        if job["status"] in statuses:
+            return job
+        time.sleep(0.05)
+    raise AssertionError(f"job {job_id} did not reach {statuses}")
+
+
+def hang_instance(instance: Portal, monkeypatch) -> None:
+    """Simulate a killed/hung old instance: heartbeat stops, last beat ages out."""
+    monkeypatch.setattr(instance, "_beat", lambda: None)
+    with instance.db.transaction() as conn:
+        conn.execute(
+            "UPDATE instances SET heartbeat_ts = 0 WHERE instance_id = ?",
+            (instance.instance_id,),
+        )
+
+
+def test_handover_with_live_old_instance_lets_paused_job_publish(tmp_path):
+    """New instance boots while the old one is paused at the publish gate.
+
+    The newcomer must neither fail the old instance's job nor delete its temp
+    file; once unpaused, the old instance publishes and the file downloads.
+    """
+    data_dir = tmp_path / "data"
+    old = handover_portal(data_dir)
+    upload(old, CSV_SPRING)
+    old.db.set_settings({"pause_generation": "1"})
+    job_id = old.create_job("B1")
+    wait_for_status(old, job_id, "paused")
+    tmp_file = next((data_dir / "tmp").glob("*.csv"))
+    assert tmp_file.exists()
+
+    new = handover_portal(data_dir)
+    try:
+        # Startup recovery left the live old instance's job and temp file alone.
+        assert get_job(new, job_id)["status"] == "paused"
+        assert tmp_file.exists()
+
+        # The steady-state reaper leaves it alone too (a few cycles pass).
+        time.sleep(0.6)
+        assert get_job(new, job_id)["status"] == "paused"
+        assert tmp_file.exists()
+
+        # Unpausing lets the old instance finish the publication itself.
+        new.db.set_settings({"pause_generation": "0"})
+        job = wait_for(old, job_id)
+        assert job["status"] == "completed"
+
+        export = next(e for e in new.exports() if e["job_id"] == job_id)
+        assert export["status"] == "ready"
+        handle, _name, error = new.open_download(export["id"])
+        assert error is None and handle is not None
+        content = handle.read().decode("utf-8")
+        handle.close()
+        assert "春天第一段访谈正文" in content
+    finally:
+        new.shutdown()
+        old.shutdown()
+
+
+def test_handover_revocation_while_old_instance_paused_still_blocks(tmp_path):
+    """A revocation handled by the new instance mid-handover still blocks."""
+    data_dir = tmp_path / "data"
+    old = handover_portal(data_dir)
+    upload(old, CSV_SPRING)
+    old.db.set_settings({"pause_generation": "1"})
+    job_id = old.create_job("B1")
+    wait_for_status(old, job_id, "paused")
+    tmp_file = next((data_dir / "tmp").glob("*.csv"))
+
+    new = handover_portal(data_dir)
+    try:
+        result = new.revoke("R2")
+        assert result["blocked_jobs"] == 1
+
+        # The old instance's gate sees the block, abandons and removes its tmp.
+        wait_for_status(old, job_id, "blocked")
+        deadline = time.monotonic() + 5
+        while tmp_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not tmp_file.exists()
+        assert new.exports() == []
+
+        # Nothing may publish that job afterwards, even once unpaused.
+        new.db.set_settings({"pause_generation": "0"})
+        time.sleep(0.5)
+        assert get_job(new, job_id)["status"] == "blocked"
+        assert new.exports() == []
+    finally:
+        new.shutdown()
+        old.shutdown()
+
+
+def test_handover_with_dead_old_instance_fails_jobs_and_continues_queue(
+    tmp_path, monkeypatch
+):
+    """New instance boots after the old one died mid-generation.
+
+    The interrupted job is failed and its temp file removed, the queued job is
+    processed, and the already-downloadable export is not swept.
+    """
+    data_dir = tmp_path / "data"
+    old = handover_portal(data_dir)
+    upload(old, CSV_SPRING)
+
+    ready_job = old.create_job("B2")
+    wait_for(old, ready_job)
+    ready_export = old.exports()[0]
+    ready_path = data_dir / "exports" / ready_export["stored_name"]
+    assert ready_path.exists()
+
+    old.db.set_settings({"pause_generation": "1"})
+    paused_job = old.create_job("B1")
+    wait_for_status(old, paused_job, "paused")
+    queued_job = old.create_job("B2")
+    tmp_file = next((data_dir / "tmp").glob("*.csv"))
+    assert tmp_file.exists()
+
+    # The old instance dies before the new one comes up.
+    hang_instance(old, monkeypatch)
+
+    new = handover_portal(data_dir)
+    try:
+        # Startup recovery: interrupted job failed, temp file removed.
+        job = get_job(new, paused_job)
+        assert job["status"] == "failed"
+        assert "重启" in job["message"]
+        assert not tmp_file.exists()
+        assert get_job(new, queued_job)["status"] != "failed"
+
+        # The downloadable file from before the handover is untouched.
+        assert ready_path.exists()
+        handle, _name, error = new.open_download(ready_export["id"])
+        assert error is None and handle is not None
+        content = handle.read().decode("utf-8")
+        handle.close()
+        assert "另一个批次的正文" in content
+
+        # The queued job is picked up and finishes once unpaused.
+        new.db.set_settings({"pause_generation": "0"})
+        job = wait_for(new, queued_job)
+        assert job["status"] == "completed"
+
+        # The dead old instance must not publish its reaped job afterwards.
+        time.sleep(0.6)
+        assert get_job(new, paused_job)["status"] == "failed"
+        exports = new.exports()
+        assert len(exports) == 2
+        assert all(e["job_id"] != paused_job for e in exports)
+    finally:
+        new.shutdown()
+        old.shutdown()
+
+
+def test_reaper_fails_paused_job_when_peer_dies_after_startup(tmp_path, monkeypatch):
+    """Old instance dies *after* the new one is already up (rolling overlap).
+
+    The surviving instance's periodic reaper notices the stale heartbeat,
+    fails the interrupted job and removes the leftover temp file.
+    """
+    data_dir = tmp_path / "data"
+    old = handover_portal(data_dir)
+    upload(old, CSV_SPRING)
+    old.db.set_settings({"pause_generation": "1"})
+    job_id = old.create_job("B1")
+    wait_for_status(old, job_id, "paused")
+    tmp_file = next((data_dir / "tmp").glob("*.csv"))
+
+    new = handover_portal(data_dir)
+    try:
+        # While the old instance lives, the newcomer leaves the job alone.
+        assert get_job(new, job_id)["status"] == "paused"
+        assert tmp_file.exists()
+
+        # Now the old instance dies mid-handover.
+        hang_instance(old, monkeypatch)
+
+        job = wait_for_status(new, job_id, "failed")
+        assert "重启" in job["message"]
+        deadline = time.monotonic() + 5
+        while tmp_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not tmp_file.exists()
+
+        # The corpse must not publish afterwards; nothing becomes downloadable.
+        new.db.set_settings({"pause_generation": "0"})
+        time.sleep(0.6)
+        assert get_job(new, job_id)["status"] == "failed"
+        assert new.exports() == []
+    finally:
+        new.shutdown()
+        old.shutdown()

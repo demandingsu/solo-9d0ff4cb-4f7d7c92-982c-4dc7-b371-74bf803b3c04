@@ -65,7 +65,17 @@ CREATE TABLE IF NOT EXISTS jobs (
     total_rows      INTEGER NOT NULL DEFAULT 0,
     written_rows    INTEGER NOT NULL DEFAULT 0,
     export_id       INTEGER,
-    message         TEXT
+    message         TEXT,
+    owner_id        TEXT
+);
+
+-- Live service instances sharing this data volume. Each instance heartbeats
+-- here so a starting or surviving instance can tell a live old instance
+-- (leave its in-flight jobs alone) from a dead one (reap its jobs).
+CREATE TABLE IF NOT EXISTS instances (
+    instance_id  TEXT PRIMARY KEY,
+    started_at   TEXT NOT NULL,
+    heartbeat_ts REAL NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_batch ON jobs(batch);
@@ -164,6 +174,7 @@ class Database:
         try:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(SCHEMA)
+            self._migrate(conn)
         finally:
             conn.close()
         seeded = dict(DEFAULT_SETTINGS)
@@ -174,6 +185,15 @@ class Database:
                     "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
                     (key, value),
                 )
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Bring databases created by older versions up to date."""
+        job_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(jobs)")
+        }
+        if "owner_id" not in job_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN owner_id TEXT")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
